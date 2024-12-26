@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "domain_keyword": [
+        "quickconnect",
+        "meiying"
+      ],
+      "domain_suffix": [
+        "synology.com",
+        "synology.me",
+        "dyndns.org",
+        "apple.com",
+        "icloud.com"
+      ]
+    }
+  ]
+}
