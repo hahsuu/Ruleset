@@ -8,10 +8,13 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write # Grant write permissions for the repository contents
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
-
+        
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
@@ -24,21 +27,23 @@ jobs:
         run: python generate_json.py
 
       - name: Debug Generated Files
-        run: ls -l *.json
+        run: ls -l *.json || echo "No JSON files found."
 
-      - name: Check Git Status
-        run: git status
-
-      - name: Commit and Push Changes
-        env:
-          PAT: ${{ secrets.PAT }}
+      - name: Add generated files to staging
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add *.json
+          git diff-index --cached --quiet HEAD || echo "Files added to staging."
+
+      - name: Commit changes
+        run: |
           if git diff-index --quiet HEAD --; then
             echo "No changes to commit."
           else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
             git commit -m "Update JSON files from list files"
-            git push "https://${PAT}@github.com/${{ github.repository }}.git" HEAD:${{ github.ref_name }}
           fi
+
+      - name: Push changes
+        run: |
+          git push origin HEAD:${{ github.ref_name }} # Use GITHUB_TOKEN implicitly
