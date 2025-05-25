@@ -14,6 +14,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 0 # 获取完整的提交历史
         
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -44,6 +46,8 @@ jobs:
             git commit -m "Update JSON files from list files"
           fi
 
+      - name: Pull latest changes before pushing
+        run: git pull --rebase origin ${{ github.ref_name }}
+
       - name: Push changes
-        run: |
-          git push origin HEAD:${{ github.ref_name }} # Use GITHUB_TOKEN implicitly
+        run: git push origin HEAD:${{ github.ref_name }} # Use GITHUB_TOKEN implicitly
