@@ -12,70 +12,77 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - name: Checkout with full history
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 获取完整提交历史
-          ref: ${{ github.ref }}  # 显式指定引用
+          fetch-depth: 0
+          ref: ${{ github.ref }}
 
-      # 添加关键的准备步骤
-      - name: Configure Git Safety
+      - name: Temporal Synchronization Lock
         run: |
-          # 禁用自动换行转换（避免CRLF问题）
-          git config --global core.autocrlf false
-          # 允许历史不相干的仓库合并
-          git config --global pull.rebase true
+          # 获取当前时间戳作为唯一标识
+          lockfile=".git/gha-lock-$(date +%s)"
+          git pull origin ${{ github.ref_name }} 2>&1 | tee $lockfile
+          # 检查是否有真实冲突
+          if grep -q "CONFLICT" $lockfile; then
+            echo "发现真实冲突，需要人工干预！"
+            exit 1
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.x'
+          python-version: '3.10'
 
-      - name: Install dependencies
-        run: pip install json5
-
-      # 添加强制同步步骤
-      - name: Force Synchronize with Remote
+      - name: Generate JSON files
         run: |
-          git fetch origin
-          git reset --hard origin/${{ github.ref_name }}
-          git clean -fd
-
-      # 在同步后重新生成文件
-      - name: Run Python Script
-        run: python generate_json.py
-
-      - name: Add generated files to staging
-        run: |
-          git add -u  # 更新所有已跟踪文件的变更
-          git add *.json  # 添加新生成的 JSON 文件
-          git status  # 显示状态确认
-
-      - name: Commit changes
-        run: |
-          if git diff-index --quiet HEAD --; then
-            echo "No changes to commit."
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git commit -m "Automated JSON update: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          # 生成前清理旧文件
+          find . -name "*.json" -exec rm {} \;
+          python generate_json.py
+          # 验证生成结果
+          if [ $(ls *.json | wc -l) -eq 0 ]; then
+            echo "错误：未生成任何JSON文件"
+            exit 1
           fi
 
-      # 强化推送步骤
-      - name: Push changes
+      - name: Atomic Commit
         run: |
-          attempt=0
-          max_attempts=3
-          until [ $attempt -ge $max_attempts ]; do
-            git pull --rebase origin ${{ github.ref_name }}
-            if git push origin HEAD:${{ github.ref_name }}; then
-              echo "Push succeeded!"
-              exit 0
-            else
-              attempt=$((attempt + 1))
-              echo "Push attempt $attempt failed. Retrying..."
-              sleep 5
+          git config --global user.name "Automated Processor"
+          git config --global user.email "auto@users.noreply.github.com"
+          
+          # 使用临时分支避免污染主分支
+          git checkout -B gh-actions-$(date +%s)
+          
+          # 精准添加文件
+          git add $(ls *.json | tr '\n' ' ')
+          
+          # 差异检查策略
+          if [ -z "$(git diff --staged)" ]; then
+            echo "没有需要提交的变更"
+            exit 0
+          fi
+          
+          git commit -m "Atomic Update: $(date -uIs)"
+          
+          # 重基到最新版本
+          git pull --rebase origin ${{ github.ref_name}}
+          
+          # 冲突检测
+          if [ -f .git/rebase-apply/applying ]; then
+            echo "检测到自动解决失败的冲突"
+            exit 1
+          fi
+
+      - name: Smart Push
+        run: |
+          max_retry=3
+          count=0
+          until git push origin HEAD:${{ github.ref_name }} --force-with-lease; do
+            count=$((count + 1))
+            if [ $count -ge $max_retry ]; then
+              echo "达到最大重试次数"
+              exit 1
             fi
+            git pull --rebase origin ${{ github.ref_name }}
+            sleep $((RANDOM % 5 + 1)) # 随机等待避免活锁
           done
-          echo "All push attempts failed. Manual intervention required."
-          exit 1
