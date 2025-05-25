@@ -9,14 +9,23 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     permissions:
-      contents: write # Grant write permissions for the repository contents
+      contents: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
         with:
-          fetch-depth: 0 # 获取完整的提交历史
-        
+          fetch-depth: 0  # 获取完整提交历史
+          ref: ${{ github.ref }}  # 显式指定引用
+
+      # 添加关键的准备步骤
+      - name: Configure Git Safety
+        run: |
+          # 禁用自动换行转换（避免CRLF问题）
+          git config --global core.autocrlf false
+          # 允许历史不相干的仓库合并
+          git config --global pull.rebase true
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
@@ -25,16 +34,22 @@ jobs:
       - name: Install dependencies
         run: pip install json5
 
+      # 添加强制同步步骤
+      - name: Force Synchronize with Remote
+        run: |
+          git fetch origin
+          git reset --hard origin/${{ github.ref_name }}
+          git clean -fd
+
+      # 在同步后重新生成文件
       - name: Run Python Script
         run: python generate_json.py
 
-      - name: Debug Generated Files
-        run: ls -l *.json || echo "No JSON files found."
-
       - name: Add generated files to staging
         run: |
-          git add *.json
-          git diff-index --cached --quiet HEAD || echo "Files added to staging."
+          git add -u  # 更新所有已跟踪文件的变更
+          git add *.json  # 添加新生成的 JSON 文件
+          git status  # 显示状态确认
 
       - name: Commit changes
         run: |
@@ -43,11 +58,24 @@ jobs:
           else
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git commit -m "Update JSON files from list files"
+            git commit -m "Automated JSON update: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           fi
 
-      - name: Pull latest changes before pushing
-        run: git pull --rebase origin ${{ github.ref_name }}
-
+      # 强化推送步骤
       - name: Push changes
-        run: git push origin HEAD:${{ github.ref_name }} # Use GITHUB_TOKEN implicitly
+        run: |
+          attempt=0
+          max_attempts=3
+          until [ $attempt -ge $max_attempts ]; do
+            git pull --rebase origin ${{ github.ref_name }}
+            if git push origin HEAD:${{ github.ref_name }}; then
+              echo "Push succeeded!"
+              exit 0
+            else
+              attempt=$((attempt + 1))
+              echo "Push attempt $attempt failed. Retrying..."
+              sleep 5
+            fi
+          done
+          echo "All push attempts failed. Manual intervention required."
+          exit 1
