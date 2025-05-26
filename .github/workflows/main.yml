@@ -6,7 +6,7 @@ on:
       - "*.list"
   workflow_dispatch:
 
-concurrency: 
+concurrency:
   group: json-updater-${{ github.ref }}
   cancel-in-progress: true
 
@@ -15,119 +15,106 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
-      pull-requests: write
 
     steps:
-      # 阶段1：深度检出代码
+      # 阶段1：深度检出（带完整历史）
       - name: Checkout with full history
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ github.ref }}
 
-      # 阶段2：创建同步锚点
-      - name: Create Sync Anchor
+      # 阶段2：建立原子锁
+      - name: Create Atomic Lock
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
-          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
           
-          # 生成唯一同步标记
-          sync_tag="sync-$(date +%s)"
-          echo "SYNC_TAG=$sync_tag" >> $GITHUB_ENV
-          git tag $sync_tag
-          git push origin $sync_tag
+          # 生成唯一锁标记
+          lock_tag="lock-$(date +%s)"
+          git tag $lock_tag
+          git push origin $lock_tag
+          echo "LOCK_TAG=$lock_tag" >> $GITHUB_ENV
 
-      # 阶段3：强制同步仓库
-      - name: Hard Reset to Origin
+      # 阶段3：实时同步
+      - name: Live Synchronization
         run: |
-          git fetch origin --tags --force
-          git reset --hard origin/${{ github.ref_name }}
-          git clean -fd -x
-          
-          # 验证同步锚点
-          if ! git show-ref --tags $SYNC_TAG; then
-            echo "同步锚点丢失，流程终止"
+          # 每5秒同步一次直到超时
+          timeout 60 bash -c '
+            while ! git fetch --all --prune --tags; do
+              sleep 1
+            done;
+            git reset --hard origin/${{ github.ref_name }}
+            git clean -ffdx
+          ' || (echo "同步超时"; exit 1)
+
+          # 验证锁标记
+          if ! git tag --list $LOCK_TAG; then
+            echo "原子锁丢失，终止流程"
             exit 1
           fi
 
       # 阶段4：文件生成
       - name: Generate JSON Files
         run: |
-          # 清除旧文件（幂等操作）
-          find . -name "*.json" -delete
+          # 清理旧文件（兼容手动删除）
+          find . -name "*.json" -delete 2>/dev/null || true
           
-          # 执行生成脚本
           python generate_json.py
           
-          # 验证生成结果
-          if [ $(ls -1 *.json 2>/dev/null | wc -l) -eq 0 ]; then
-            echo "错误：未生成任何JSON文件"
+          # 严格验证输出
+          json_count=$(find . -name "*.json" | wc -l)
+          if [ $json_count -eq 0 ]; then
+            echo "生成失败：未检测到JSON文件"
             exit 1
           fi
 
-      # 阶段5：智能提交
+      # 阶段5：原子提交
       - name: Atomic Commit
         run: |
-          # 哈希校验避免空提交
-          pre_hash=$(git rev-parse HEAD)
-          git add *.json
-          post_hash=$(git write-tree)
-          
-          if [ "$pre_hash" = "$post_hash" ]; then
-            echo "无文件变更，跳过提交"
+          git add -A
+          if git diff-index --quiet HEAD --; then
+            echo "无变更需要提交"
             exit 0
           fi
 
-          # 生成可信时间戳
-          timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          git commit -m "Automated Update [$timestamp]"
-          
-          # 基于最新远程状态变基
-          git fetch origin
-          if ! git rebase origin/${{ github.ref_name }}; then
-            echo "变基冲突，采用策略：接受远程版本"
-            git checkout --theirs .
-            git add -u
-            git rebase --continue || (git rebase --abort && exit 1)
-          fi
+          # 生成防冲突时间戳
+          timestamp=$(date -u +"%Y%m%d-%H%M%S-%3N")
+          git commit -m "AutoUpdate-$timestamp"
 
-      # 阶段6：安全推送
-      - name: Force Push with Lease
+          # 实时变基
+          git pull --rebase origin ${{ github.ref_name }} || (
+            git rebase --abort
+            echo "变基冲突，执行强制同步"
+            git reset --hard origin/${{ github.ref_name }}
+            git clean -ffdx
+            exit 1
+          )
+
+      # 阶段6：原子推送
+      - name: Atomic Push
         run: |
-          max_attempts=3
-          for attempt in $(seq 1 $max_attempts); do
-            git fetch --all
+          for i in {1..5}; do
+            git fetch origin
             
-            # 优先使用安全推送
-            if git push origin HEAD:${{ github.ref_name }} --force-with-lease; then
+            # 使用双重校验推送
+            if git push origin HEAD:${{ github.ref_name }} \
+              --force-with-lease=refs/remotes/origin/${{ github.ref_name }}:refs/tags/$LOCK_TAG; then
               echo "推送成功"
               exit 0
             fi
 
-            # 冲突解决策略
-            if [ $attempt -eq $max_attempts ]; then
-              echo "最终尝试：强制推送"
-              git push origin HEAD:${{ github.ref_name }} --force
-              exit 0
-            fi
-
-            # 指数退避等待
-            sleep_time=$((2 ** $attempt))
-            echo "等待 ${sleep_time}s 后重试..."
-            sleep $sleep_time
-            
-            # 刷新本地仓库
+            # 冲突应急处理
             git reset --hard origin/${{ github.ref_name }}
-            git clean -fd
-            git pull --rebase
+            git clean -ffdx
+            sleep $((i * 2))
           done
 
-          echo "所有推送尝试失败"
-          exit 1
+          echo "推送失败，执行终极强制推送"
+          git push origin HEAD:${{ github.ref_name }} --force
 
-      # 阶段7：清理环境
-      - name: Cleanup Artifacts
+      # 阶段7：清理锁
+      - name: Cleanup Lock
         run: |
-          git push --delete origin $SYNC_TAG || echo "锚点已自动清除"
-          git tag -d $SYNC_TAG || true
+          git push --delete origin $LOCK_TAG || true
+          git tag -d $LOCK_TAG || true
