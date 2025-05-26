@@ -1,148 +1,35 @@
-name: Generate JSON Files from List Files
+name: Convert LIST to JSON
 
 on:
   push:
     paths:
-      - "*.list"
-  workflow_dispatch:
-
-concurrency:
-  group: json-updater-${{ github.ref }}
-  cancel-in-progress: true
+      - '**.list'
+  pull_request:
+    paths:
+      - '**.list'
+  workflow_dispatch:  # 允许手动触发
 
 jobs:
-  generate-and-push:
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write # 确保有写权限
+  convert:
+    runs-on: ubuntu-latest
 
     steps:
-      # 阶段1：深度检出（带完整历史）
-      - name: Checkout with full history
+      - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ github.ref }}
 
-      # 阶段2：建立原子锁
-      - name: Create Atomic Lock
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Run conversion script
+        run: python3 generate_json.py
+
+      - name: Commit changes
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
-          
-          # 生成唯一锁标记
-          lock_tag="lock-$(date +%s)"
-          git tag $lock_tag
-          # 推送锁标签，如果失败说明可能有其他并发进程在抢占，需要立即停止
-          if ! git push origin $lock_tag; then
-            echo "::error::Failed to push lock tag. Another process might be active. Aborting."
-            exit 1
-          fi
-          echo "LOCK_TAG=$lock_tag" >> $GITHUB_ENV
-
-      # 阶段3：实时同步
-      - name: Live Synchronization
-        run: |
-          # 每5秒同步一次直到超时
-          timeout 60 bash -c '
-            while ! git fetch --all --prune --tags; do
-              sleep 1
-            done;
-            git reset --hard origin/${{ github.ref_name }}
-            git clean -ffdx
-          ' || (echo "::error::Synchronization timeout. Aborting."; exit 1)
-
-          # 验证锁标记
-          if ! git tag --list $LOCK_TAG; then
-            echo "::error::Atomic lock lost, terminating workflow. Another process might have deleted the lock."
-            exit 1
-          fi
-
-      # 阶段4：文件生成
-      - name: Generate JSON Files
-        run: |
-          # 清理旧文件（兼容手动删除）
-          find . -name "*.json" -delete 2>/dev/null || true
-          
-          python generate_json.py
-          
-          # 严格验证输出
-          json_count=$(find . -name "*.json" | wc -l)
-          if [ $json_count -eq 0 ]; then
-            echo "::error::Generation failed: No JSON files detected."
-            exit 1
-          fi
-
-      # 阶段5：原子提交
-      - name: Atomic Commit
-        run: |
-          git add -A
-          if git diff-index --quiet HEAD --; then
-            echo "No changes to commit. Skipping commit and push phases."
-            exit 0 # 如果没有变更，则安全退出，不进行后续推送
-          fi
-
-          # 生成防冲突时间戳
-          timestamp=$(date -u +"%Y%m%d-%H%M%S-%3N")
-          git commit -m "AutoUpdate-$timestamp"
-
-          # 实时变基：尝试将本地提交变基到远程最新状态
-          # 如果变基失败（通常是冲突），则强制重置到远程，并重新生成（如果需要的话，取决于你的业务逻辑）
-          git pull --rebase origin ${{ github.ref_name }} || (
-            echo "::warning::Rebase conflict detected or rebase failed. Attempting to abort rebase and reset to remote."
-            git rebase --abort # 尝试中止变基
-            # 如果变基冲突，我们此时的本地代码状态是冲突的，最好是退回到远程最新状态
-            # 这可能意味着需要重新运行 generate_json.py，但更安全的选择是让本次运行失败，等待下一次触发
-            git reset --hard origin/${{ github.ref_name }}
-            git clean -ffdx
-            echo "::error::Rebase failed and branch reset. This workflow run cannot safely push. Exiting."
-            exit 1 # 变基失败通常意味着逻辑冲突，不能强行推送，应让工作流失败
-          )
-
-      # 阶段6：原子推送 (增强稳定性)
-      - name: Atomic Push (Enhanced)
-        run: |
-          MAX_RETRIES=10 # 增加重试次数
-          RETRY_DELAY=5  # 每次重试间隔秒数
-
-          for i in $(seq 1 $MAX_RETRIES); do
-            echo "Attempt $i of $MAX_RETRIES: Pushing changes..."
-            git fetch origin ${{ github.ref_name }} # 每次尝试前先fetch，更新远程ref
-
-            # 使用 --force-with-lease 进行安全推送
-            # 它会检查远程分支是否在上次fetch后被修改过
-            if git push origin HEAD:${{ github.ref_name }} \
-               --force-with-lease=refs/remotes/origin/${{ github.ref_name }}; then
-              echo "Push successful on attempt $i."
-              exit 0 # 推送成功，退出循环
-            fi
-
-            echo "::warning::Force-with-lease failed on attempt $i. Remote might have changed. Re-syncing and retrying..."
-            
-            # 如果 --force-with-lease 失败，说明远程有新提交，需要重新拉取并尝试变基
-            git pull --rebase origin ${{ github.ref_name }} || (
-              echo "::error::Rebase failed during retry. This usually indicates a persistent conflict. Aborting."
-              git rebase --abort || true # 再次尝试中止变基，防止残留
-              git reset --hard origin/${{ github.ref_name }} # 强制重置
-              git clean -ffdx
-              exit 1 # 如果重试变基也失败，则退出
-            )
-
-            sleep $RETRY_DELAY # 等待一段时间再重试
-          done
-
-          echo "::error::All push attempts failed after $MAX_RETRIES retries. Something is preventing the push."
-          echo "::error::If the issue persists, consider manually inspecting the branch and protection rules."
-          exit 1 # 所有重试都失败，工作流退出并报错
-
-      # 阶段7：清理锁
-      - name: Cleanup Lock
-        if: always() # 确保无论之前步骤是否成功，都会尝试清理锁
-        run: |
-          # 确保 LOCK_TAG 变量存在
-          if [ -n "$LOCK_TAG" ]; then
-            git push --delete origin $LOCK_TAG || echo "::warning::Failed to delete remote lock tag $LOCK_TAG. It might already be gone."
-            git tag -d $LOCK_TAG || echo "::warning::Failed to delete local lock tag $LOCK_TAG. It might already be gone."
-          else
-            echo "::warning::LOCK_TAG variable not set, skipping lock cleanup."
-          fi
+          git add *.json
+          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-generated JSON files"
+          git push
