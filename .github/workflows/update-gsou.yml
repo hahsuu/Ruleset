@@ -1,0 +1,41 @@
+name: Download File Automatically
+
+on:
+  schedule:
+    # 定时触发，使用UTC时间。此例为每天UTC时间0点运行（相当于北京时间8点）
+    - cron: '0 0 * * *'
+  push: # 允许手动触发：在GitHub网页上点击运行
+  workflow_dispatch:
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      # 步骤1：获取仓库代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 步骤2：下载文件（核心步骤）
+      - name: Download file
+        run: |
+          # 使用curl或wget下载文件，-L参数表示跟随重定向
+          curl -L -o ./gsou.yaml "https://sub.gsocloud.xyz/cHVJcmt6Z0NmMXM4NkFvMT9jbGFzaD0x"
+          # 如果需要，可以用wget
+          # wget -O ./path/in/your/repository/filename.txt "https://your-file-direct-link.com/file.txt"
+
+      # 步骤3：配置Git用户信息（为提交做准备）
+      - name: Setup Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      # 步骤4：提交文件变更回仓库
+      - name: Commit and push if changed
+        run: |
+          git add .
+          if ! git diff --staged --quiet; then
+            git commit -m "Auto: Update downloaded file [$(date)]"
+            git push
+          else
+            echo "No changes to commit."
+          fi
