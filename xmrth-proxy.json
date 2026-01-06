@@ -3,7 +3,9 @@
   "rules": [
     {
       "domain_keyword": [],
-      "domain_suffix": []
+      "domain_suffix": [
+        "xmrth.one"
+      ]
     }
   ]
 }
